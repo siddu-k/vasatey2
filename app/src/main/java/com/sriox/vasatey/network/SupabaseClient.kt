@@ -2,7 +2,7 @@ package com.sriox.vasatey.network
 
 import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.createSupabaseClient
-import io.github.jan.supabase.gotrue.GoTrue
+import io.github.jan.supabase.auth.Auth
 import io.github.jan.supabase.postgrest.Postgrest
 
 object SupabaseClient {
@@ -14,7 +14,7 @@ object SupabaseClient {
         supabaseUrl = SUPABASE_URL,
         supabaseKey = SUPABASE_KEY
     ) {
-        install(GoTrue)
+        install(Auth)
         install(Postgrest)
     }
 }

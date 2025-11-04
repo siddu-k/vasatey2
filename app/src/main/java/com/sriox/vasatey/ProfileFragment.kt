@@ -1,31 +1,29 @@
+
 package com.sriox.vasatey
 
 import android.os.Bundle
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.widget.EditText
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.fragment.app.Fragment
-import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.firestore.FirebaseFirestore
+import androidx.lifecycle.lifecycleScope
 import com.sriox.vasatey.databinding.FragmentProfileBinding
-import com.sriox.vasatey.models.User
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import com.sriox.vasatey.models.User // Assuming you have a User data class
+import com.sriox.vasatey.network.SupabaseInstance
+import io.github.jan.supabase.auth.auth
+import io.github.jan.supabase.postgrest.from
+import io.github.jan.supabase.postgrest.query.Columns
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.tasks.await
-import kotlinx.coroutines.withContext
 
 class ProfileFragment : Fragment() {
 
     private var _binding: FragmentProfileBinding? = null
     private val binding get() = _binding!!
 
-    private val auth = FirebaseAuth.getInstance()
-    private val db = FirebaseFirestore.getInstance()
-    private var currentUser: User? = null
+    private val client = SupabaseInstance.client
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -42,78 +40,96 @@ class ProfileFragment : Fragment() {
 
         binding.updateProfileButton.setOnClickListener {
             val newName = binding.nameInput.text.toString().trim()
-            if (newName.isNotEmpty()) {
-                updateUserName(newName)
+            val newMobile = binding.mobileInput.text.toString().trim()
+
+            if (newName.isNotEmpty() && newMobile.isNotEmpty()) {
+                updateUserProfile(newName, newMobile)
+            } else {
+                Toast.makeText(requireContext(), "Please fill all fields", Toast.LENGTH_SHORT).show()
             }
         }
 
         binding.changePasswordButton.setOnClickListener {
-            showSecurityQuestionsDialog()
+            showPasswordResetConfirmationDialog()
         }
     }
 
     private fun loadUserData() {
-        val userEmail = auth.currentUser?.email
-        if (userEmail != null) {
-            db.collection("users").document(userEmail).get()
-                .addOnSuccessListener { document ->
-                    if (document != null) {
-                        currentUser = document.toObject(User::class.java)
-                        binding.nameInput.setText(currentUser?.name)
-                        binding.emailInput.setText(currentUser?.email)
-                        binding.emailInput.isEnabled = false // Don't allow email editing
+        lifecycleScope.launch {
+            try {
+                val user = client.auth.currentUserOrNull()
+                if (user != null && user.email != null) {
+                    val userData = client.from("users").select(columns = Columns.ALL) {
+                        filter {
+                            eq("email", user.email!!)
+                        }
+                    }.decodeSingle<User>()
+
+                    binding.nameInput.setText(userData.username)
+                    binding.emailInput.setText(userData.email)
+                    binding.mobileInput.setText(userData.mobileNumber)
+                    binding.emailInput.isEnabled = false
+                }
+            } catch (e: Exception) {
+                Log.e("ProfileFragment", "Failed to load user data", e)
+                Toast.makeText(requireContext(), "Failed to load profile", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun updateUserProfile(newName: String, newMobile: String) {
+        lifecycleScope.launch {
+            try {
+                val userEmail = client.auth.currentUserOrNull()?.email ?: return@launch
+                
+                val updates = mapOf(
+                    "username" to newName,
+                    "mobile_number" to newMobile
+                )
+
+                client.from("users").update(updates) {
+                    filter {
+                        eq("email", userEmail)
                     }
                 }
-        }
-    }
-
-    private fun updateUserName(newName: String) {
-        val userEmail = auth.currentUser?.email
-        if (userEmail != null) {
-            db.collection("users").document(userEmail).update("name", newName)
-                .addOnSuccessListener {
-                    Toast.makeText(requireContext(), "Name updated successfully", Toast.LENGTH_SHORT).show()
-                }
-                .addOnFailureListener { 
-                    Toast.makeText(requireContext(), "Failed to update name", Toast.LENGTH_SHORT).show()
-                }
-        }
-    }
-
-    private fun showSecurityQuestionsDialog() {
-        val dialogView = LayoutInflater.from(requireContext()).inflate(R.layout.dialog_security_questions, null)
-        val schoolInput = dialogView.findViewById<EditText>(R.id.schoolAnswer)
-        val petInput = dialogView.findViewById<EditText>(R.id.petAnswer)
-
-        AlertDialog.Builder(requireContext())
-            .setTitle("Verify Your Identity")
-            .setView(dialogView)
-            .setPositiveButton("Verify") { _, _ ->
-                val schoolAnswer = schoolInput.text.toString().trim()
-                val petAnswer = petInput.text.toString().trim()
-                verifySecurityAnswers(schoolAnswer, petAnswer)
+                Toast.makeText(requireContext(), "Profile updated successfully", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Log.e("ProfileFragment", "Failed to update profile", e)
+                Toast.makeText(requireContext(), "Failed to update profile", Toast.LENGTH_SHORT).show()
             }
-            .setNegativeButton("Cancel", null)
+        }
+    }
+
+    private fun showPasswordResetConfirmationDialog() {
+        AlertDialog.Builder(requireContext())
+            .setTitle("Change Password")
+            .setMessage("Are you sure you want to send a password reset email?")
+            .setPositiveButton("Yes") { _, _ ->
+                sendPasswordResetEmail()
+            }
+            .setNegativeButton("No", null)
             .show()
     }
 
-    private fun verifySecurityAnswers(schoolAnswer: String, petAnswer: String) {
-        val storedSchoolAnswer = currentUser?.securityQuestions?.get("school")
-        val storedPetAnswer = currentUser?.securityQuestions?.get("pet")
-
-        if (schoolAnswer.equals(storedSchoolAnswer, ignoreCase = true) && petAnswer.equals(storedPetAnswer, ignoreCase = true)) {
-            sendPasswordResetEmail()
-        } else {
-            Toast.makeText(requireContext(), "Answers do not match. Please try again.", Toast.LENGTH_LONG).show()
+    private fun sendPasswordResetEmail() {
+        lifecycleScope.launch {
+            try {
+                val userEmail = client.auth.currentUserOrNull()?.email
+                if (userEmail != null) {
+                    client.auth.resetPasswordForEmail(userEmail)
+                    Toast.makeText(requireContext(), "Password reset email sent. Check your inbox.", Toast.LENGTH_LONG).show()
+                } else {
+                    Toast.makeText(requireContext(), "Could not find user email.", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                Log.e("ProfileFragment", "Failed to send reset email", e)
+                Toast.makeText(requireContext(), "Failed to send password reset email.", Toast.LENGTH_LONG).show()
+            }
         }
     }
 
-    private fun sendPasswordResetEmail() {
-        val userEmail = auth.currentUser?.email
-        if (userEmail != null) {
-            auth.sendPasswordResetEmail(userEmail)
-                .addOnCompleteListener { task ->
-                    if (task.isSuccessful) {
-                        Toast.makeText(requireContext(), "Password reset email sent. Please check your inbox.", Toast.LENGTH_LONG).show()
-                    } else {
-                        Toast.makeText(require...
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

@@ -1,11 +1,18 @@
+
 package com.sriox.vasatey
 
 import android.Manifest
+import android.app.ActivityManager
 import android.app.AlertDialog
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -13,11 +20,16 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
-import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.firestore.FieldValue
-import com.google.firebase.firestore.FirebaseFirestore
-import com.google.firebase.firestore.SetOptions
+import androidx.lifecycle.lifecycleScope
 import com.sriox.vasatey.databinding.FragmentHelpSettingsBinding
+import com.sriox.vasatey.models.User
+import com.sriox.vasatey.network.SupabaseInstance
+import io.github.jan.supabase.auth.auth
+import io.github.jan.supabase.postgrest.from
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 class HelpSettingsFragment : Fragment() {
 
@@ -27,20 +39,14 @@ class HelpSettingsFragment : Fragment() {
     private val permissions = arrayOf(
         Manifest.permission.RECORD_AUDIO,
         Manifest.permission.POST_NOTIFICATIONS,
-        Manifest.permission.FOREGROUND_SERVICE_MICROPHONE
+        Manifest.permission.FOREGROUND_SERVICE_MICROPHONE,
+        Manifest.permission.ACCESS_FINE_LOCATION
     )
 
-    private val auth = FirebaseAuth.getInstance()
-    private val db = FirebaseFirestore.getInstance()
-    private val currentUserEmail get() = auth.currentUser?.email ?: ""
+    private val client = SupabaseInstance.client
+    private var isProgrammaticCheck = false
 
-    private var accessKey: String? = null
-
-    override fun onCreateView(
-        inflater: LayoutInflater,
-        container: ViewGroup?,
-        savedInstanceState: Bundle?
-    ): View {
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
         _binding = FragmentHelpSettingsBinding.inflate(inflater, container, false)
         return binding.root
     }
@@ -48,11 +54,13 @@ class HelpSettingsFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
-        listenForAccessKeyUpdate()
+        loadInitialSettings()
 
         binding.startButton.setOnClickListener {
-            if (accessKey.isNullOrEmpty()) {
+            if (binding.accessKeyInput.text.toString().isEmpty()) {
                 showAccessKeyAlert()
+            } else if (!isIgnoringBatteryOptimizations()) {
+                showBatteryOptimizationDialog()
             } else if (hasPermissions()) {
                 startListeningService()
             } else {
@@ -61,23 +69,119 @@ class HelpSettingsFragment : Fragment() {
         }
 
         binding.stopButton.setOnClickListener { stopListeningService() }
-
         binding.saveAccessKeyButton.setOnClickListener {
             val accessKey = binding.accessKeyInput.text.toString().trim()
             if (accessKey.isNotEmpty()) saveAccessKey(accessKey)
         }
-
         binding.deleteAccessKeyButton.setOnClickListener { deleteAccessKey() }
-    }
 
-    private val requestPermissions =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { perms ->
-            if (perms.values.all { it }) startListeningService()
+        binding.wakeWordRadioGroup.setOnCheckedChangeListener { _, checkedId ->
+            if (isProgrammaticCheck) return@setOnCheckedChangeListener
+
+            val selectedWakeWord = if (checkedId == R.id.helpMeRadioButton) "help-me" else "leave-me-alone"
+            saveWakeWordPreference(selectedWakeWord)
+
+            if (isServiceRunning(ListeningService::class.java)) {
+                Toast.makeText(requireContext(), "Restarting listener with new wake word...", Toast.LENGTH_LONG).show()
+                CoroutineScope(Dispatchers.Main).launch {
+                    stopListeningService(false)
+                    delay(500)
+                    startListeningService()
+                }
+            }
         }
-
-    private fun hasPermissions(): Boolean = permissions.all {
-        ContextCompat.checkSelfPermission(requireContext(), it) == PackageManager.PERMISSION_GRANTED
     }
+
+    private fun loadInitialSettings() {
+        lifecycleScope.launch {
+            val userEmail = client.auth.currentUserOrNull()?.email ?: return@launch
+            try {
+                val user = client.from("users").select() { filter { eq("email", userEmail) } }.decodeSingle<User>()
+                binding.accessKeyInput.setText(user.accessKey)
+                isProgrammaticCheck = true
+                if (user.wakeWord == "leave-me-alone") {
+                    binding.wakeWordRadioGroup.check(R.id.leaveMeAloneRadioButton)
+                } else {
+                    binding.wakeWordRadioGroup.check(R.id.helpMeRadioButton)
+                }
+                isProgrammaticCheck = false
+            } catch (e: Exception) {
+                Log.e("HelpSettings", "Failed to load settings", e)
+            }
+        }
+    }
+
+    private fun saveAccessKey(accessKey: String) {
+        lifecycleScope.launch {
+            val userEmail = client.auth.currentUserOrNull()?.email ?: return@launch
+            try {
+                client.from("users").update(mapOf("access_key" to accessKey)) { filter { eq("email", userEmail) } }
+                Toast.makeText(requireContext(), "Access Key saved", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Toast.makeText(requireContext(), "Failed to save key", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun deleteAccessKey() {
+        lifecycleScope.launch {
+            val userEmail = client.auth.currentUserOrNull()?.email ?: return@launch
+            try {
+                client.from("users").update(mapOf("access_key" to null)) { filter { eq("email", userEmail) } }
+                Toast.makeText(requireContext(), "Access Key deleted", Toast.LENGTH_SHORT).show()
+                binding.accessKeyInput.text?.clear()
+            } catch (e: Exception) {
+                Toast.makeText(requireContext(), "Failed to delete key", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun saveWakeWordPreference(wakeWord: String) {
+        lifecycleScope.launch {
+            val userEmail = client.auth.currentUserOrNull()?.email ?: return@launch
+            try {
+                client.from("users").update(mapOf("wake_word" to wakeWord)) { filter { eq("email", userEmail) } }
+            } catch (e: Exception) {
+                 Log.e("HelpSettings", "Failed to save wake word", e)
+            }
+        }
+    }
+    
+    // --- The rest of the functions (permissions, service management, dialogs) remain the same ---
+
+    private fun isServiceRunning(serviceClass: Class<*>): Boolean {
+        val manager = requireContext().getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        return manager.getRunningServices(Integer.MAX_VALUE).any { serviceClass.name == it.service.className }
+    }
+
+    private fun isIgnoringBatteryOptimizations(): Boolean {
+        val powerManager = requireContext().getSystemService(Context.POWER_SERVICE) as PowerManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            powerManager.isIgnoringBatteryOptimizations(requireContext().packageName)
+        } else {
+            true
+        }
+    }
+
+    private fun showBatteryOptimizationDialog() {
+        AlertDialog.Builder(requireContext())
+            .setTitle("Enable Background Operation")
+            .setMessage("For the help alert to work reliably, please allow the app to ignore battery optimizations.")
+            .setPositiveButton("Go to Settings") { _, _ ->
+                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                    data = Uri.parse("package:" + requireContext().packageName)
+                }
+                startActivity(intent)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private val requestPermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { perms ->
+        if (perms.values.all { it }) startListeningService()
+    }
+
+    private fun hasPermissions(): Boolean = permissions.all { ContextCompat.checkSelfPermission(requireContext(), it) == PackageManager.PERMISSION_GRANTED }
 
     private fun startListeningService() {
         val intent = Intent(requireContext(), ListeningService::class.java)
@@ -85,52 +189,18 @@ class HelpSettingsFragment : Fragment() {
         Toast.makeText(requireContext(), "Listening started", Toast.LENGTH_SHORT).show()
     }
 
-    private fun stopListeningService() {
+    private fun stopListeningService(showToast: Boolean = true) {
         val intent = Intent(requireContext(), ListeningService::class.java)
         requireContext().stopService(intent)
-        Toast.makeText(requireContext(), "Listening stopped", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun saveAccessKey(accessKey: String) {
-        val userRef = db.collection("users").document(currentUserEmail)
-        userRef.set(mapOf("accessKey" to accessKey), SetOptions.merge())
-            .addOnSuccessListener {
-                Toast.makeText(requireContext(), "Access Key saved", Toast.LENGTH_SHORT).show()
-            }
-            .addOnFailureListener {
-                Toast.makeText(requireContext(), "Failed to save Access Key", Toast.LENGTH_SHORT).show()
-            }
-    }
-
-    private fun deleteAccessKey() {
-        val userRef = db.collection("users").document(currentUserEmail)
-        userRef.update(mapOf("accessKey" to FieldValue.delete()))
-            .addOnSuccessListener {
-                Toast.makeText(requireContext(), "Access Key deleted", Toast.LENGTH_SHORT).show()
-                binding.accessKeyInput.text.clear()
-            }
-            .addOnFailureListener {
-                Toast.makeText(requireContext(), "Failed to delete Access Key", Toast.LENGTH_SHORT).show()
-            }
-    }
-
-    private fun listenForAccessKeyUpdate() {
-        if (currentUserEmail.isEmpty()) return
-        val userRef = db.collection("users").document(currentUserEmail)
-        userRef.addSnapshotListener { snapshot, error ->
-            if (error != null) return@addSnapshotListener
-            accessKey = snapshot?.getString("accessKey")
-            binding.accessKeyInput.setText(accessKey)
-        }
+        if (showToast) Toast.makeText(requireContext(), "Listening stopped", Toast.LENGTH_SHORT).show()
     }
 
     private fun showAccessKeyAlert() {
         AlertDialog.Builder(requireContext())
             .setTitle("Access Key Required")
-            .setMessage("Please add your Picovoice Access Key to start listening. You can get a free key by logging in to the Picovoice Console. Also, please add your mail ID to your GitHub profile link. Note: You cannot use this key in other device for one month.")
+            .setMessage("Please add your Picovoice Access Key to start listening.")
             .setPositiveButton("Get Key") { _, _ ->
-                val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://console.picovoice.ai/login"))
-                startActivity(intent)
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://console.picovoice.ai/login")))
             }
             .setNegativeButton("Cancel", null)
             .show()
